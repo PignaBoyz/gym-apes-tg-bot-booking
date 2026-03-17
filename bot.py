@@ -3,8 +3,8 @@ import json
 import requests
 from flask import Flask, request
 import telebot
-from datetime import datetime, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from datetime import datetime, timedelta
 
 # ============================================================
 #                CONFIGURATION
@@ -22,7 +22,7 @@ bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
 # ============================================================
-#                TIME SLOTS (with extra before/after)
+#                TIME SLOTS
 # ============================================================
 
 hours = (
@@ -35,29 +35,17 @@ days = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "
 months = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
 
 # ============================================================
-#                MULTI-GROUP DATABASE
+#                MULTIGROUP DATABASE (PERSISTED)
 # ============================================================
 
-# Structure:
-# {
-#   "groups": {
-#       "<chat_id>": {
-#           "db": { day: { hour: [entries] }},
-#           "user_selections": {},
-#           "delete_state": {}
-#       }
-#   }
-# }
-
-GLOBAL_DB = { "groups": {} }
+GLOBAL_DB = {"groups": {}}
 
 def ensure_group(chat_id):
     cid = str(chat_id)
     if cid not in GLOBAL_DB["groups"]:
         GLOBAL_DB["groups"][cid] = {
-            "db": { g: {h: [] for h in hours} for g in days },
-            "user_selections": {},
-            "delete_state": {}
+            "db": {g: {h: [] for h in hours} for g in days},
+            "user_selections": {}
         }
     return GLOBAL_DB["groups"][cid]
 
@@ -71,14 +59,17 @@ def load_db():
     global GLOBAL_DB
     try:
         url = f"https://api.github.com/gists/{GIST_ID}"
-        r = requests.get(url, headers=_gist_headers(), timeout=10)
-        r.raise_for_status()
-        raw = r.json()
-        content = raw["files"][GIST_FILENAME]["content"]
-        GLOBAL_DB = json.loads(content)
-        if "groups" not in GLOBAL_DB:
+        resp = requests.get(url, headers=_gist_headers(), timeout=10)
+        resp.raise_for_status()
+        gist = resp.json()
+        content = gist["files"][GIST_FILENAME]["content"]
+        data = json.loads(content)
+
+        if isinstance(data, dict) and "groups" in data:
+            GLOBAL_DB = data
+            print("✔ Loaded multi-group DB")
+        else:
             GLOBAL_DB = {"groups": {}}
-        print("✔ Multi-group DB loaded")
     except Exception as e:
         print(f"[WARN] Cannot load Gist: {e}")
         GLOBAL_DB = {"groups": {}}
@@ -93,14 +84,40 @@ def save_db():
             }
         }
         url = f"https://api.github.com/gists/{GIST_ID}"
-        r = requests.patch(url, headers=_gist_headers(), json=payload, timeout=10)
-        r.raise_for_status()
-        print("✔ Multi-group DB saved")
+        resp = requests.patch(url, headers=_gist_headers(), json=payload, timeout=10)
+        resp.raise_for_status()
+        print("✔ Saved multi-group DB")
     except Exception as e:
         print(f"[WARN] Cannot save Gist: {e}")
 
+
 if GIST_TOKEN and GIST_ID:
     load_db()
+
+# ============================================================
+#         RUNTIME-ONLY DELETE STATE (NOT PERSISTED)
+# ============================================================
+
+DELETE_STATE = {}   # { "<chat_id>": { uid: {"items": [(day,hour)], "selected": set() } } }
+
+def _ensure_delete_state(chat_id, uid, first_name, group):
+    """Rebuild delete state if absent (e.g. restart / redeploy)."""
+    chat_key = str(chat_id)
+    if chat_key not in DELETE_STATE:
+        DELETE_STATE[chat_key] = {}
+
+    state = DELETE_STATE[chat_key].get(uid)
+    if not state:
+        # Rebuild available bookings
+        items = []
+        for d in days:
+            for h in hours:
+                if any(matches_user(e, uid, first_name) for e in group["db"][d][h]):
+                    items.append((d, h))
+        state = {"items": items, "selected": set()}
+        DELETE_STATE[chat_key][uid] = state
+
+    return state
 
 # ============================================================
 #                HELPERS
@@ -114,19 +131,18 @@ def is_owner(chat_id, user_id):
         return False
 
 def reset_group_state(group):
-    group["db"] = { g: {h: [] for h in hours} for g in days }
+    group["db"] = {g: {h: [] for h in hours} for g in days}
     group["user_selections"] = {}
-    group["delete_state"] = {}
     save_db()
 
 def get_week_dates():
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
-    res = {}
+    out = {}
     for i, g in enumerate(days):
         d = monday + timedelta(days=i)
-        res[g] = (d.day, months[d.month - 1])
-    return res
+        out[g] = (d.day, months[d.month - 1])
+    return out
 
 def matches_user(entry, uid, name):
     if isinstance(entry, dict):
@@ -135,30 +151,39 @@ def matches_user(entry, uid, name):
 
 def display_entry(entry):
     if isinstance(entry, dict):
-        first = entry.get("first_name") or "?"
-        uname = entry.get("username")
-        return f"{first} (@{uname})" if uname else first
+        nm = entry.get("first_name") or "?"
+        un = entry.get("username")
+        return f"{nm} (@{un})" if un else nm
     return str(entry)
+
+def get_user_bookings(group, uid, first_name):
+    res = []
+    for d in days:
+        for h in hours:
+            if any(matches_user(e, uid, first_name) for e in group["db"][d][h]):
+                res.append((d, h))
+    return res
 
 def generate_summary(group):
     txt = "🦍 **RIEPILOGO ALLENAMENTI SETTIMANALI** 🦍\n\n"
-    week = get_week_dates()
+    wd = get_week_dates()
     empty = True
 
-    for g in days:
+    for d in days:
         lines = []
         for h in hours:
-            ppl = group["db"][g][h]
+            ppl = group["db"][d][h]
             if ppl:
                 names = ", ".join(display_entry(p) for p in ppl)
                 lines.append(f" {h}: {names}")
         if lines:
-            dn, m = week[g]
-            txt += f"**{g} {dn} {m}**\n" + "\n".join(lines) + "\n\n"
+            dayn, m = wd[d]
+            txt += f"**{d} {dayn} {m}**\n" + "\n".join(lines) + "\n\n"
             empty = False
 
     if empty:
         txt += "_Nessuna prenotazione._"
+
     return txt
 
 # ============================================================
@@ -168,20 +193,21 @@ def generate_summary(group):
 def keyboard_days(selected):
     markup = InlineKeyboardMarkup()
     row = []
-    for g in days:
-        label = f"✅ {g}" if g in selected else g
-        btn = InlineKeyboardButton(label, callback_data=f"selgiorno_{g}")
+    for d in days:
+        label = f"✅ {d}" if d in selected else d
+        btn = InlineKeyboardButton(label, callback_data=f"selgiorno_{d}")
         row.append(btn)
         if len(row) == 2:
             markup.row(*row)
             row = []
-    if len(row) == 1:
+    if row:
         markup.row(row[0])
 
     markup.row(InlineKeyboardButton("🗑️ Cancella", callback_data="cancella_tutto"))
     if selected:
         markup.row(InlineKeyboardButton("➡️ CONFERMA GIORNI", callback_data="conferma_giorni"))
     return markup
+
 
 def keyboard_hours(day):
     markup = InlineKeyboardMarkup()
@@ -196,6 +222,7 @@ def keyboard_hours(day):
         markup.row(row[0])
     return markup
 
+
 def keyboard_delete(bookings, selected):
     markup = InlineKeyboardMarkup()
     for i, (d, h) in enumerate(bookings):
@@ -209,10 +236,11 @@ def keyboard_delete(bookings, selected):
         )
     else:
         markup.add(InlineKeyboardButton("↩️ Chiudi", callback_data="delcancel"))
+
     return markup
 
 # ============================================================
-#                BOT COMMANDS
+#                HANDLERS
 # ============================================================
 
 @bot.message_handler(commands=["start", "allenamento"])
@@ -225,16 +253,13 @@ def start(message):
         return
 
     reset_group_state(group)
+
     bot.send_message(
         chat_id,
         generate_summary(group),
         reply_markup=keyboard_days([]),
         parse_mode="Markdown"
     )
-
-# ============================================================
-#                CALLBACKS (MULTIGROUP)
-# ============================================================
 
 @bot.callback_query_handler(func=lambda c: True)
 def callback(c):
@@ -245,88 +270,133 @@ def callback(c):
     first = c.from_user.first_name or ""
     uname = c.from_user.username
     data = c.data
-    msg = c.message.message_id
+    mid = c.message.message_id
 
-    # --- DELETE FLOW ---
+    # ============================================================
+    #                DELETE MODE
+    # ============================================================
+
     if data == "cancella_tutto":
-        bookings = []
-        for d in days:
-            for h in hours:
-                if any(matches_user(e, uid, first) for e in group["db"][d][h]):
-                    bookings.append((d, h))
-
-        group["delete_state"][uid] = {"items": bookings, "selected": set()}
-        save_db()
-
-        bot.edit_message_text(
-            "Seleziona le prenotazioni da cancellare:",
-            chat_id, msg,
-            reply_markup=keyboard_delete(bookings, set()),
-            parse_mode="Markdown"
-        )
+        st = _ensure_delete_state(chat_id, uid, first, group)
+        try:
+            bot.edit_message_text(
+                "Seleziona le prenotazioni da cancellare:",
+                chat_id, mid,
+                reply_markup=keyboard_delete(st["items"], st["selected"]),
+                parse_mode="Markdown"
+            )
+        except:
+            bot.send_message(
+                chat_id, "Seleziona le prenotazioni da cancellare:",
+                reply_markup=keyboard_delete(st["items"], st["selected"]),
+                parse_mode="Markdown"
+            )
         return
 
     if data.startswith("delpick_"):
-        idx = int(data.split("_", 1)[1])
-        state = group["delete_state"][uid]
-        if idx in state["selected"]:
-            state["selected"].remove(idx)
-        else:
-            state["selected"].add(idx)
-        save_db()
+        st = _ensure_delete_state(chat_id, uid, first, group)
+        try:
+            idx = int(data.split("_", 1)[1])
+        except ValueError:
+            bot.answer_callback_query(c.id, "Selezione non valida.")
+            return
 
-        bot.edit_message_reply_markup(
-            chat_id, msg,
-            reply_markup=keyboard_delete(state["items"], state["selected"])
-        )
+        if 0 <= idx < len(st["items"]):
+            if idx in st["selected"]:
+                st["selected"].remove(idx)
+            else:
+                st["selected"].add(idx)
+
+        try:
+            bot.edit_message_reply_markup(
+                chat_id, mid,
+                reply_markup=keyboard_delete(st["items"], st["selected"])
+            )
+        except:
+            pass
+
+        bot.answer_callback_query(c.id)
         return
 
     if data == "delconfirm":
-        state = group["delete_state"].get(uid, {})
-        for i in sorted(state.get("selected", [])):
-            d, h = state["items"][i]
+        st = DELETE_STATE.get(str(chat_id), {}).get(uid)
+        if not st or not st["selected"]:
+            try:
+                bot.edit_message_text(
+                    generate_summary(group), chat_id, mid,
+                    reply_markup=keyboard_days([]), parse_mode="Markdown"
+                )
+            except:
+                bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+            bot.answer_callback_query(c.id, "Nessuna selezione da cancellare.")
+            return
+
+        for i in sorted(st["selected"]):
+            d, h = st["items"][i]
             group["db"][d][h] = [
                 e for e in group["db"][d][h]
                 if not matches_user(e, uid, first)
             ]
-        group["delete_state"].pop(uid, None)
+
+        # cleanup RAM-only state
+        DELETE_STATE[str(chat_id)].pop(uid, None)
+
         save_db()
 
-        bot.edit_message_text(
-            generate_summary(group),
-            chat_id, msg,
-            reply_markup=keyboard_days([]),
-            parse_mode="Markdown"
-        )
+        try:
+            bot.edit_message_text(
+                generate_summary(group), chat_id, mid,
+                reply_markup=keyboard_days([]), parse_mode="Markdown"
+            )
+        except:
+            bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+
+        bot.answer_callback_query(c.id, "Prenotazioni selezionate cancellate.")
         return
 
     if data == "delcancel":
-        group["delete_state"].pop(uid, None)
-        bot.edit_message_text(
-            generate_summary(group),
-            chat_id, msg,
-            reply_markup=keyboard_days([]),
-            parse_mode="Markdown"
-        )
+        if str(chat_id) in DELETE_STATE:
+            DELETE_STATE[str(chat_id)].pop(uid, None)
+
+        try:
+            bot.edit_message_text(
+                generate_summary(group), chat_id, mid,
+                reply_markup=keyboard_days([]), parse_mode="Markdown"
+            )
+        except:
+            bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+        bot.answer_callback_query(c.id, "Annullato.")
         return
 
-    # --- SELECT DAY ---
+    # ============================================================
+    #                DAY SELECTION
+    # ============================================================
+
     if data.startswith("selgiorno_"):
-        day = data.split("_", 1)[1]
+        d = data.split("_", 1)[1]
         sel = group["user_selections"].setdefault(uid, {"days": [], "index": 0})
-        if day in sel["days"]:
-            sel["days"].remove(day)
+
+        if d in sel["days"]:
+            sel["days"].remove(d)
         else:
-            sel["days"].append(day)
+            sel["days"].append(d)
+
         save_db()
 
-        bot.edit_message_reply_markup(
-            chat_id, msg,
-            reply_markup=keyboard_days(sel["days"])
-        )
+        try:
+            bot.edit_message_reply_markup(
+                chat_id, mid, reply_markup=keyboard_days(sel["days"])
+            )
+        except:
+            pass
+
+        bot.answer_callback_query(c.id)
         return
 
-    # --- CONFIRM DAYS ---
+    # ============================================================
+    #                CONFIRM DAYS
+    # ============================================================
+
     if data == "conferma_giorni":
         sel = group["user_selections"].get(uid)
         if not sel or not sel["days"]:
@@ -334,24 +404,37 @@ def callback(c):
             return
 
         sel["index"] = 0
-        first_day = sel["days"][0]
+        d0 = sel["days"][0]
         save_db()
 
-        bot.edit_message_text(
-            f"Ottimo {first}! Per **{first_day}**, a che ora ci sarai?",
-            chat_id, msg,
-            reply_markup=keyboard_hours(first_day),
-            parse_mode="Markdown"
-        )
+        try:
+            bot.edit_message_text(
+                f"Ottimo {first}! Per **{d0}**, a che ora ci sarai?",
+                chat_id, mid,
+                reply_markup=keyboard_hours(d0),
+                parse_mode="Markdown"
+            )
+        except:
+            bot.send_message(
+                chat_id,
+                f"Ottimo {first}! Per **{d0}**, a che ora ci sarai?",
+                reply_markup=keyboard_hours(d0),
+                parse_mode="Markdown"
+            )
+        bot.answer_callback_query(c.id)
         return
 
-    # --- SELECT HOUR ---
+    # ============================================================
+    #                HOUR SELECTION
+    # ============================================================
+
     if data.startswith("selora_"):
         _, d, h = data.split("_", 2)
         sel = group["user_selections"][uid]
 
         entry = {"id": uid, "first_name": first, "username": uname}
 
+        # avoid duplicates
         if not any(matches_user(e, uid, first) for e in group["db"][d][h]):
             group["db"][d][h].append(entry)
             save_db()
@@ -359,25 +442,37 @@ def callback(c):
         sel["index"] += 1
         if sel["index"] < len(sel["days"]):
             nxt = sel["days"][sel["index"]]
-            bot.edit_message_text(
-                f"E per **{nxt}**?",
-                chat_id, msg,
-                reply_markup=keyboard_hours(nxt),
-                parse_mode="Markdown"
-            )
+            try:
+                bot.edit_message_text(
+                    f"E per **{nxt}**?",
+                    chat_id, mid,
+                    reply_markup=keyboard_hours(nxt),
+                    parse_mode="Markdown"
+                )
+            except:
+                bot.send_message(
+                    chat_id,
+                    f"E per **{nxt}**?",
+                    reply_markup=keyboard_hours(nxt),
+                    parse_mode="Markdown"
+                )
         else:
             group["user_selections"].pop(uid, None)
             save_db()
-            bot.edit_message_text(
-                generate_summary(group),
-                chat_id, msg,
-                reply_markup=keyboard_days([]),
-                parse_mode="Markdown"
-            )
+
+            try:
+                bot.edit_message_text(
+                    generate_summary(group), chat_id, mid,
+                    reply_markup=keyboard_days([]), parse_mode="Markdown"
+                )
+            except:
+                bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+
+        bot.answer_callback_query(c.id, "Registrato!")
         return
 
 # ============================================================
-#                WEBHOOK
+#                WEBHOOK ENDPOINTS
 # ============================================================
 
 @app.get("/")
@@ -401,6 +496,10 @@ def webhook():
         bot.process_new_updates([telebot.types.Update.de_json(update)])
     return "OK", 200
 
+# ============================================================
+#                START
+# ============================================================
+
 if __name__ == "__main__":
-    print("🚀 Bot running with webhook...")
+    print("🚀 Bot running with webhook…")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
