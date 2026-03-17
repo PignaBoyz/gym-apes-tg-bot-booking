@@ -9,3 +9,9 @@ services:
         sync: false
       - key: APP_URL
         sync: false
+      - key: GIST_TOKEN
+        sync: false
+      - key: GIST_ID
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false

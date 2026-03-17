@@ -1,134 +1,309 @@
 import os
+import json
+import requests
 from flask import Flask, request
 import telebot
+from datetime import datetime, timedelta
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ============================================================
+#                CONFIGURATION
+# ============================================================
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-APP_URL = os.environ.get("APP_URL")  # Es: https://tuo-bot.onrender.com
-WEBHOOK_SECRET = "webhooksecret"  # Cambialo se vuoi più sicurezza
+APP_URL = os.environ.get("APP_URL")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "webhooksecret")
+
+GIST_TOKEN = os.environ.get("GIST_TOKEN")
+GIST_ID = os.environ.get("GIST_ID")
+GIST_FILENAME = "allenamenti.json"
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
-# ---------- QUI INZIA IL TUO CODICE ORIGINALE (INVARIATO) ----------
+# ============================================================
+#                DATABASE IN MEMORY + GIST PERSISTENCE
+# ============================================================
 
-import time
-from datetime import datetime, timedelta
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+days = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
+hours = [f"dalle {h}:00" for h in range(9, 21)]
+months = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
 
-giorni_settimana = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
-orari_disponibili = [f"dalle {h}:00" for h in range(9, 21)]
-db_allenamenti = {g: {o: [] for o in orari_disponibili} for g in giorni_settimana}
+db_trainings = {g: {o: [] for o in hours} for g in days}
 user_selections = {}
 
-MESI = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
 
-def is_admin(chat_id, user_id):
+def _gist_headers():
+    return {
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+
+def load_db():
+    global db_trainings, user_selections
     try:
-        admins = bot.get_chat_administrators(chat_id)
-        return any(admin.user.id == user_id for admin in admins)
-    except:
-        return False
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        resp = requests.get(url, headers=_gist_headers(), timeout=10)
+        resp.raise_for_status()
+        data = json.loads(resp.json()["files"][GIST_FILENAME]["content"])
+
+        db_trainings = data.get("db_trainings", db_trainings)
+        user_selections = data.get("user_selections", user_selections)
+
+        print("✔ Loaded data from Gist")
+    except Exception as e:
+        print(f"[WARN] Cannot load Gist: {e}")
+
+
+def save_db():
+    try:
+        payload = {
+            "files": {
+                GIST_FILENAME: {
+                    "content": json.dumps({
+                        "db_trainings": db_trainings,
+                        "user_selections": user_selections
+                    }, ensure_ascii=False, indent=2)
+                }
+            }
+        }
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        resp = requests.patch(url, headers=_gist_headers(), json=payload, timeout=10)
+        resp.raise_for_status()
+        print("✔ Saved data to Gist")
+    except Exception as e:
+        print(f"[WARN] Cannot save to Gist: {e}")
+
+
+if GIST_TOKEN and GIST_ID:
+    load_db()
+else:
+    print("⚠ Persistence disabled (missing GIST_TOKEN/GIST_ID)")
+
+# ============================================================
+#                BOT LOGIC
+# ============================================================
 
 def is_owner(chat_id, user_id):
     try:
         admins = bot.get_chat_administrators(chat_id)
-        return any(admin.user.id == user_id and admin.status == "creator" for admin in admins)
+        return any(a.user.id == user_id and a.status == "creator" for a in admins)
     except:
         return False
 
-def resetta_allenamenti():
-    for g in giorni_settimana:
-        for ora in orari_disponibili:
-            db_allenamenti[g][ora] = []
-    user_selections.clear()
+
+def reset_trainings():
+    global db_trainings, user_selections
+    db_trainings = {g: {o: [] for o in hours} for g in days}
+    user_selections = {}
+    save_db()
+
 
 def get_week_dates():
     today = datetime.now()
     monday = today - timedelta(days=today.weekday())
-    result = {}
-    for i, g in enumerate(giorni_settimana):
-        day = monday + timedelta(days=i)
-        result[g] = (day.day, MESI[day.month - 1])
-    return result
+    res = {}
+    for i, g in enumerate(days):
+        d = monday + timedelta(days=i)
+        res[g] = (d.day, months[d.month - 1])
+    return res
 
-def genera_tabella_riepilogo():
-    testo = "🦍 **RIEPILOGO ALLENAMENTI SETTIMANALI** 🦍\n\n"
-    week_dates = get_week_dates()
-    vuoto = True
-    for g in giorni_settimana:
-        linee = []
-        for ora in orari_disponibili:
-            atleti = db_allenamenti[g][ora]
-            if atleti:
-                linee.append(f" {ora}: {', '.join(atleti)}")
-        if linee:
-            day_num, mese = week_dates[g]
-            testo += f"**{g} {day_num} {mese}**\n" + "\n".join(linee) + "\n\n"
-            vuoto = False
-    if vuoto:
-        testo += "_Nessuna prenotazione._"
-    return testo
 
-def tastiera_scelta_giorni(selected_days):
+def generate_summary():
+    summary = "🦍 **RIEPILOGO ALLENAMENTI SETTIMANALI** 🦍\n\n"
+    week = get_week_dates()
+    empty = True
+
+    for g in days:
+        lines = []
+        for h in hours:
+            people = db_trainings[g][h]
+            if people:
+                lines.append(f" {h}: {', '.join(people)}")
+        if lines:
+            day_num, month = week[g]
+            summary += f"**{g} {day_num} {month}**\n" + "\n".join(lines) + "\n\n"
+            empty = False
+
+    if empty:
+        summary += "_Nessuna prenotazione._"
+
+    return summary
+
+
+def keyboard_days(selected):
     markup = InlineKeyboardMarkup(row_width=2)
-    btns = []
-    for g in giorni_settimana:
-        label = f"✅ {g}" if g in selected_days else g
-        btns.append(InlineKeyboardButton(label, callback_data=f"selgiorno_{g}"))
-    markup.add(*btns)
-    markup.add(InlineKeyboardButton("🗑️ Cancella", callback_data="cancella_tutto"))
-    if selected_days:
-        markup.add(InlineKeyboardButton("➡️ CONFERMA GIORNI", callback_data="conferma_giorni"))
+    for g in days:
+        label = f"✅ {g}" if g in selected else g
+        markup.add(InlineKeyboardButton(label, callback_data=f"selday_{g}"))
+    markup.add(InlineKeyboardButton("🗑️ Cancella", callback_data="del_all"))
+    if selected:
+        markup.add(InlineKeyboardButton("➡️ CONFERMA", callback_data="confirm_days"))
     return markup
 
-def tastiera_orari(giorno):
+
+def keyboard_hours(day):
     markup = InlineKeyboardMarkup(row_width=3)
-    btns = [InlineKeyboardButton(ora, callback_data=f"selora_{giorno}_{ora}") for ora in orari_disponibili]
-    markup.add(*btns)
+    for h in hours:
+        markup.add(InlineKeyboardButton(h, callback_data=f"selhour_{day}_{h}"))
     return markup
 
-@bot.message_handler(commands=['allenamento', 'start'])
+
+# ============================================================
+#                HANDLERS
+# ============================================================
+
+@bot.message_handler(commands=["start", "allenamento"])
 def start(message):
     if not is_owner(message.chat.id, message.from_user.id):
-        bot.send_message(message.chat.id, "❌ Solo il proprietario del gruppo può usare questo comando.")
+        bot.send_message(message.chat.id, "❌ Solo il proprietario può usare questo comando.")
         return
 
-    resetta_allenamenti()
+    reset_trainings()
     bot.send_message(
         message.chat.id,
-        genera_tabella_riepilogo(),
-        reply_markup=tastiera_scelta_giorni([]),
-        parse_mode='Markdown'
+        generate_summary(),
+        reply_markup=keyboard_days([]),
+        parse_mode="Markdown"
     )
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    # tutto il tuo codice callback invariato…
-    # 🔥 già copiato sopra, rimane uguale
-    pass   # <-- sostituisci con il contenuto integrale della tua funzione
 
-# ---------- QUI FINISCE IL TUO CODICE ORIGINALE ----------
+@bot.callback_query_handler(func=lambda c: True)
+def callback(c):
+    uid = c.from_user.id
+    name = c.from_user.first_name
+    data = c.data
+    chat = c.message.chat.id
+    mid = c.message.message_id
+
+    # ---------------- DELETE ALL ----------------
+    if data == "del_all":
+        for g in days:
+            for h in hours:
+                if name in db_trainings[g][h]:
+                    db_trainings[g][h].remove(name)
+
+        save_db()
+
+        bot.edit_message_text(
+            generate_summary(),
+            chat, mid,
+            reply_markup=keyboard_days([]),
+            parse_mode="Markdown"
+        )
+        bot.answer_callback_query(c.id, "Prenotazioni cancellate.")
+        return
+
+    # ---------------- SELECT DAY ----------------
+    if data.startswith("selday_"):
+        day = data.split("_", 1)[1]
+
+        if uid not in user_selections:
+            user_selections[uid] = {"days": [], "index": 0}
+
+        if day in user_selections[uid]["days"]:
+            user_selections[uid]["days"].remove(day)
+        else:
+            user_selections[uid]["days"].append(day)
+
+        try:
+            bot.edit_message_reply_markup(
+                chat, mid,
+                reply_markup=keyboard_days(user_selections[uid]["days"])
+            )
+        except:
+            pass
+
+        bot.answer_callback_query(c.id)
+        return
+
+    # ---------------- CONFIRM DAYS ----------------
+    if data == "confirm_days":
+        if uid not in user_selections or not user_selections[uid]["days"]:
+            bot.answer_callback_query(c.id, "Seleziona almeno un giorno!")
+            return
+
+        user_selections[uid]["index"] = 0
+        first = user_selections[uid]["days"][0]
+
+        bot.edit_message_text(
+            f"Ottimo {name}! Per **{first}**, a che ora?",
+            chat, mid,
+            reply_markup=keyboard_hours(first),
+            parse_mode="Markdown"
+        )
+
+        bot.answer_callback_query(c.id)
+        return
+
+    # ---------------- SELECT HOUR ----------------
+    if data.startswith("selhour_"):
+        _, day, hour = data.split("_", 2)
+
+        if name not in db_trainings[day][hour]:
+            db_trainings[day][hour].append(name)
+            save_db()
+
+        user_selections[uid]["index"] += 1
+        idx = user_selections[uid]["index"]
+        selected = user_selections[uid]["days"]
+
+        if idx < len(selected):
+            nxt = selected[idx]
+            bot.edit_message_text(
+                f"E per **{nxt}**?",
+                chat, mid,
+                reply_markup=keyboard_hours(nxt),
+                parse_mode="Markdown"
+            )
+        else:
+            del user_selections[uid]
+            save_db()
+            bot.edit_message_text(
+                generate_summary(),
+                chat, mid,
+                reply_markup=keyboard_days([]),
+                parse_mode="Markdown"
+            )
+
+        bot.answer_callback_query(c.id, "Registrato!")
+        return
 
 
-# ---------- SEZIONE WEBHOOK ----------
+# ============================================================
+#                WEBHOOK ENDPOINTS
+# ============================================================
 
-@app.route("/ping", methods=["GET"])
+@app.get("/")
+def home():
+    return "OK - Gym Apes Bot running", 200
+
+
+@app.get("/ping")
 def ping():
     return "pong", 200
 
-@app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
-def webhook():
-    json_data = request.get_json()
-    bot.process_new_updates([telebot.types.Update.de_json(json_data)])
-    return "OK", 200
 
-@app.route("/setwebhook", methods=["GET"])
+@app.get("/setwebhook")
 def set_webhook():
     bot.remove_webhook()
     bot.set_webhook(url=f"{APP_URL}/webhook/{WEBHOOK_SECRET}")
-    return "Webhook impostato!", 200
+    return "Webhook set!", 200
 
+
+@app.post(f"/webhook/{WEBHOOK_SECRET}")
+def webhook():
+    update = request.get_json()
+    if update:
+        bot.process_new_updates([telebot.types.Update.de_json(update)])
+    return "OK", 200
+
+
+# ============================================================
+#                START SERVER
+# ============================================================
 
 if __name__ == "__main__":
-    print("🚀 Bot avviato tramite webhook...")
+    print("🚀 Bot running with webhook...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
