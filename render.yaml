@@ -3,7 +3,7 @@ services:
     name: gym-apes-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn bot:app
+    startCommand: gunicorn -b 0.0.0.0:$PORT bot:app
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
