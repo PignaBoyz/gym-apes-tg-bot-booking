@@ -22,7 +22,7 @@ bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
 # ============================================================
-#                TIME SLOTS
+#                TIME SLOTS (with extra before/after)
 # ============================================================
 
 hours = (
@@ -35,12 +35,31 @@ days = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "
 months = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
 
 # ============================================================
-#                DATABASE + GIST PERSISTENCE
+#                MULTI-GROUP DATABASE
 # ============================================================
 
-db_trainings = {g: {o: [] for o in hours} for g in days}
-user_selections = {}
-delete_state = {}
+# Structure:
+# {
+#   "groups": {
+#       "<chat_id>": {
+#           "db": { day: { hour: [entries] }},
+#           "user_selections": {},
+#           "delete_state": {}
+#       }
+#   }
+# }
+
+GLOBAL_DB = { "groups": {} }
+
+def ensure_group(chat_id):
+    cid = str(chat_id)
+    if cid not in GLOBAL_DB["groups"]:
+        GLOBAL_DB["groups"][cid] = {
+            "db": { g: {h: [] for h in hours} for g in days },
+            "user_selections": {},
+            "delete_state": {}
+        }
+    return GLOBAL_DB["groups"][cid]
 
 def _gist_headers():
     return {
@@ -48,49 +67,35 @@ def _gist_headers():
         "Accept": "application/vnd.github+json"
     }
 
-def _ensure_structure():
-    for g in days:
-        if g not in db_trainings:
-            db_trainings[g] = {}
-        for h in hours:
-            if h not in db_trainings[g] or not isinstance(db_trainings[g][h], list):
-                db_trainings[g][h] = []
-
 def load_db():
-    global db_trainings, user_selections
+    global GLOBAL_DB
     try:
         url = f"https://api.github.com/gists/{GIST_ID}"
         r = requests.get(url, headers=_gist_headers(), timeout=10)
         r.raise_for_status()
-        gist = r.json()
-        content = gist["files"][GIST_FILENAME]["content"]
-        data = json.loads(content)
-
-        if isinstance(data.get("db_trainings"), dict):
-            db_trainings = data["db_trainings"]
-        user_selections = data.get("user_selections", {})
-
-        _ensure_structure()
-        print("✔ Loaded data from Gist")
+        raw = r.json()
+        content = raw["files"][GIST_FILENAME]["content"]
+        GLOBAL_DB = json.loads(content)
+        if "groups" not in GLOBAL_DB:
+            GLOBAL_DB = {"groups": {}}
+        print("✔ Multi-group DB loaded")
     except Exception as e:
         print(f"[WARN] Cannot load Gist: {e}")
+        GLOBAL_DB = {"groups": {}}
 
 def save_db():
     try:
         payload = {
             "files": {
                 GIST_FILENAME: {
-                    "content": json.dumps({
-                        "db_trainings": db_trainings,
-                        "user_selections": user_selections
-                    }, ensure_ascii=False, indent=2)
+                    "content": json.dumps(GLOBAL_DB, ensure_ascii=False, indent=2)
                 }
             }
         }
         url = f"https://api.github.com/gists/{GIST_ID}"
         r = requests.patch(url, headers=_gist_headers(), json=payload, timeout=10)
         r.raise_for_status()
-        print("✔ Saved data to Gist")
+        print("✔ Multi-group DB saved")
     except Exception as e:
         print(f"[WARN] Cannot save Gist: {e}")
 
@@ -108,11 +113,10 @@ def is_owner(chat_id, user_id):
     except:
         return False
 
-def reset_trainings():
-    global db_trainings, user_selections, delete_state
-    db_trainings = {g: {o: [] for o in hours} for g in days}
-    user_selections = {}
-    delete_state = {}
+def reset_group_state(group):
+    group["db"] = { g: {h: [] for h in hours} for g in days }
+    group["user_selections"] = {}
+    group["delete_state"] = {}
     save_db()
 
 def get_week_dates():
@@ -124,19 +128,19 @@ def get_week_dates():
         res[g] = (d.day, months[d.month - 1])
     return res
 
-def display_entry(entry):
-    if isinstance(entry, dict):
-        name = entry.get("first_name") or "?"
-        uname = entry.get("username")
-        return f"{name} (@{uname})" if uname else name
-    return str(entry)
-
-def matches_user(entry, uid, first_name):
+def matches_user(entry, uid, name):
     if isinstance(entry, dict):
         return entry.get("id") == uid
-    return str(entry) == first_name
+    return str(entry) == name
 
-def generate_summary():
+def display_entry(entry):
+    if isinstance(entry, dict):
+        first = entry.get("first_name") or "?"
+        uname = entry.get("username")
+        return f"{first} (@{uname})" if uname else first
+    return str(entry)
+
+def generate_summary(group):
     txt = "🦍 **RIEPILOGO ALLENAMENTI SETTIMANALI** 🦍\n\n"
     week = get_week_dates()
     empty = True
@@ -144,7 +148,7 @@ def generate_summary():
     for g in days:
         lines = []
         for h in hours:
-            ppl = db_trainings[g][h]
+            ppl = group["db"][g][h]
             if ppl:
                 names = ", ".join(display_entry(p) for p in ppl)
                 lines.append(f" {h}: {names}")
@@ -158,36 +162,15 @@ def generate_summary():
     return txt
 
 # ============================================================
-#                KEYBOARDS (2 columns except delete)
+#                KEYBOARDS
 # ============================================================
 
 def keyboard_days(selected):
     markup = InlineKeyboardMarkup()
     row = []
-
     for g in days:
         label = f"✅ {g}" if g in selected else g
-        bt = InlineKeyboardButton(label, callback_data=f"selgiorno_{g}")
-        row.append(bt)
-        if len(row) == 2:
-            markup.row(*row)
-            row = []
-    if len(row) == 1:
-        markup.row(row[0])
-
-    markup.row(InlineKeyboardButton("🗑️ Cancella", callback_data="cancella_tutto"))
-
-    if selected:
-        markup.row(InlineKeyboardButton("➡️ CONFERMA GIORNI", callback_data="conferma_giorni"))
-
-    return markup
-
-def keyboard_hours(day):
-    markup = InlineKeyboardMarkup()
-    row = []
-
-    for h in hours:
-        btn = InlineKeyboardButton(h, callback_data=f"selora_{day}_{h}")
+        btn = InlineKeyboardButton(label, callback_data=f"selgiorno_{g}")
         row.append(btn)
         if len(row) == 2:
             markup.row(*row)
@@ -195,12 +178,26 @@ def keyboard_hours(day):
     if len(row) == 1:
         markup.row(row[0])
 
+    markup.row(InlineKeyboardButton("🗑️ Cancella", callback_data="cancella_tutto"))
+    if selected:
+        markup.row(InlineKeyboardButton("➡️ CONFERMA GIORNI", callback_data="conferma_giorni"))
     return markup
 
-# 🔥 DELETE MENU IN ONE COLUMN (your request)
+def keyboard_hours(day):
+    markup = InlineKeyboardMarkup()
+    row = []
+    for h in hours:
+        btn = InlineKeyboardButton(h, callback_data=f"selora_{day}_{h}")
+        row.append(btn)
+        if len(row) == 2:
+            markup.row(*row)
+            row = []
+    if row:
+        markup.row(row[0])
+    return markup
+
 def keyboard_delete(bookings, selected):
     markup = InlineKeyboardMarkup()
-
     for i, (d, h) in enumerate(bookings):
         label = f"{'✅ ' if i in selected else ''}{d} — {h}"
         markup.add(InlineKeyboardButton(label, callback_data=f"delpick_{i}"))
@@ -212,226 +209,180 @@ def keyboard_delete(bookings, selected):
         )
     else:
         markup.add(InlineKeyboardButton("↩️ Chiudi", callback_data="delcancel"))
-
     return markup
 
-def get_user_bookings(uid, first_name):
-    res = []
-    for d in days:
-        for h in hours:
-            if any(matches_user(e, uid, first_name) for e in db_trainings[d][h]):
-                res.append((d, h))
-    return res
-
 # ============================================================
-#                BOT LOGIC
+#                BOT COMMANDS
 # ============================================================
 
 @bot.message_handler(commands=["start", "allenamento"])
 def start(message):
-    if not is_owner(message.chat.id, message.from_user.id):
-        bot.send_message(message.chat.id, "❌ Solo il proprietario può usare questo comando.")
+    chat_id = message.chat.id
+    group = ensure_group(chat_id)
+
+    if not is_owner(chat_id, message.from_user.id):
+        bot.send_message(chat_id, "❌ Solo il proprietario può usare questo comando.")
         return
 
-    reset_trainings()
+    reset_group_state(group)
     bot.send_message(
-        message.chat.id,
-        generate_summary(),
+        chat_id,
+        generate_summary(group),
         reply_markup=keyboard_days([]),
         parse_mode="Markdown"
     )
 
+# ============================================================
+#                CALLBACKS (MULTIGROUP)
+# ============================================================
+
 @bot.callback_query_handler(func=lambda c: True)
 def callback(c):
+    chat_id = c.message.chat.id
+    group = ensure_group(chat_id)
+
     uid = c.from_user.id
     first = c.from_user.first_name or ""
     uname = c.from_user.username
     data = c.data
-    chat = c.message.chat.id
-    mid = c.message.message_id
+    msg = c.message.message_id
 
-    # --- DELETE MODE ---
+    # --- DELETE FLOW ---
     if data == "cancella_tutto":
-        bookings = get_user_bookings(uid, first)
-        delete_state[uid] = {"items": bookings, "selected": set()}
-        try:
-            bot.edit_message_text(
-                "Seleziona le prenotazioni da cancellare:",
-                chat, mid,
-                reply_markup=keyboard_delete(bookings, delete_state[uid]["selected"]),
-                parse_mode="Markdown"
-            )
-        except:
-            bot.send_message(
-                chat, "Seleziona le prenotazioni da cancellare:",
-                reply_markup=keyboard_delete(bookings, delete_state[uid]["selected"]),
-                parse_mode="Markdown"
-            )
+        bookings = []
+        for d in days:
+            for h in hours:
+                if any(matches_user(e, uid, first) for e in group["db"][d][h]):
+                    bookings.append((d, h))
+
+        group["delete_state"][uid] = {"items": bookings, "selected": set()}
+        save_db()
+
+        bot.edit_message_text(
+            "Seleziona le prenotazioni da cancellare:",
+            chat_id, msg,
+            reply_markup=keyboard_delete(bookings, set()),
+            parse_mode="Markdown"
+        )
         return
 
     if data.startswith("delpick_"):
         idx = int(data.split("_", 1)[1])
-        st = delete_state.get(uid)
-        if not st:
-            bot.answer_callback_query(c.id, "Sessione non attiva.")
-            return
-
-        if idx in st["selected"]:
-            st["selected"].remove(idx)
+        state = group["delete_state"][uid]
+        if idx in state["selected"]:
+            state["selected"].remove(idx)
         else:
-            st["selected"].add(idx)
+            state["selected"].add(idx)
+        save_db()
 
-        try:
-            bot.edit_message_reply_markup(
-                chat, mid,
-                reply_markup=keyboard_delete(st["items"], st["selected"])
-            )
-        except:
-            pass
-
-        bot.answer_callback_query(c.id)
+        bot.edit_message_reply_markup(
+            chat_id, msg,
+            reply_markup=keyboard_delete(state["items"], state["selected"])
+        )
         return
 
     if data == "delconfirm":
-        st = delete_state.get(uid)
-        if not st:
-            bot.answer_callback_query(c.id)
-            return
-
-        for i in sorted(st["selected"]):
-            d, h = st["items"][i]
-            db_trainings[d][h] = [
-                e for e in db_trainings[d][h]
+        state = group["delete_state"].get(uid, {})
+        for i in sorted(state.get("selected", [])):
+            d, h = state["items"][i]
+            group["db"][d][h] = [
+                e for e in group["db"][d][h]
                 if not matches_user(e, uid, first)
             ]
-
+        group["delete_state"].pop(uid, None)
         save_db()
-        delete_state.pop(uid, None)
 
-        try:
-            bot.edit_message_text(
-                generate_summary(), chat, mid,
-                reply_markup=keyboard_days([]),
-                parse_mode="Markdown"
-            )
-        except:
-            bot.send_message(chat, generate_summary(), reply_markup=keyboard_days([]))
-
-        bot.answer_callback_query(c.id, "Eliminato!")
+        bot.edit_message_text(
+            generate_summary(group),
+            chat_id, msg,
+            reply_markup=keyboard_days([]),
+            parse_mode="Markdown"
+        )
         return
 
     if data == "delcancel":
-        delete_state.pop(uid, None)
-        try:
-            bot.edit_message_text(
-                generate_summary(), chat, mid,
-                reply_markup=keyboard_days([]),
-                parse_mode="Markdown"
-            )
-        except:
-            bot.send_message(chat, generate_summary(), reply_markup=keyboard_days([]))
+        group["delete_state"].pop(uid, None)
+        bot.edit_message_text(
+            generate_summary(group),
+            chat_id, msg,
+            reply_markup=keyboard_days([]),
+            parse_mode="Markdown"
+        )
         return
 
-    # --- SELECT DAYS ---
+    # --- SELECT DAY ---
     if data.startswith("selgiorno_"):
         day = data.split("_", 1)[1]
-        if uid not in user_selections:
-            user_selections[uid] = {"days": [], "index": 0}
-
-        if day in user_selections[uid]["days"]:
-            user_selections[uid]["days"].remove(day)
+        sel = group["user_selections"].setdefault(uid, {"days": [], "index": 0})
+        if day in sel["days"]:
+            sel["days"].remove(day)
         else:
-            user_selections[uid]["days"].append(day)
+            sel["days"].append(day)
+        save_db()
 
-        try:
-            bot.edit_message_reply_markup(
-                chat, mid,
-                reply_markup=keyboard_days(user_selections[uid]["days"])
-            )
-        except:
-            pass
-
-        bot.answer_callback_query(c.id)
+        bot.edit_message_reply_markup(
+            chat_id, msg,
+            reply_markup=keyboard_days(sel["days"])
+        )
         return
 
     # --- CONFIRM DAYS ---
     if data == "conferma_giorni":
-        if uid not in user_selections or not user_selections[uid]["days"]:
+        sel = group["user_selections"].get(uid)
+        if not sel or not sel["days"]:
             bot.answer_callback_query(c.id, "Seleziona almeno un giorno!")
             return
 
-        user_selections[uid]["index"] = 0
-        first_day = user_selections[uid]["days"][0]
+        sel["index"] = 0
+        first_day = sel["days"][0]
+        save_db()
 
-        try:
-            bot.edit_message_text(
-                f"Ottimo {first}! Per **{first_day}**, a che ora ci sarai?",
-                chat, mid,
-                reply_markup=keyboard_hours(first_day),
-                parse_mode="Markdown"
-            )
-        except:
-            bot.send_message(
-                chat,
-                f"Ottimo {first}! Per **{first_day}**, a che ora ci sarai?",
-                reply_markup=keyboard_hours(first_day),
-                parse_mode="Markdown"
-            )
-
-        bot.answer_callback_query(c.id)
+        bot.edit_message_text(
+            f"Ottimo {first}! Per **{first_day}**, a che ora ci sarai?",
+            chat_id, msg,
+            reply_markup=keyboard_hours(first_day),
+            parse_mode="Markdown"
+        )
         return
 
     # --- SELECT HOUR ---
     if data.startswith("selora_"):
         _, d, h = data.split("_", 2)
+        sel = group["user_selections"][uid]
 
         entry = {"id": uid, "first_name": first, "username": uname}
 
-        if not any(matches_user(e, uid, first) for e in db_trainings[d][h]):
-            db_trainings[d][h].append(entry)
+        if not any(matches_user(e, uid, first) for e in group["db"][d][h]):
+            group["db"][d][h].append(entry)
             save_db()
 
-        sel = user_selections[uid]["days"]
-        idx = user_selections[uid]["index"] + 1
-        user_selections[uid]["index"] = idx
-
-        if idx < len(sel):
-            nxt = sel[idx]
-            try:
-                bot.edit_message_text(
-                    f"E per **{nxt}**?",
-                    chat, mid,
-                    reply_markup=keyboard_hours(nxt),
-                    parse_mode="Markdown"
-                )
-            except:
-                bot.send_message(
-                    chat, f"E per **{nxt}**?",
-                    reply_markup=keyboard_hours(nxt),
-                    parse_mode="Markdown"
-                )
+        sel["index"] += 1
+        if sel["index"] < len(sel["days"]):
+            nxt = sel["days"][sel["index"]]
+            bot.edit_message_text(
+                f"E per **{nxt}**?",
+                chat_id, msg,
+                reply_markup=keyboard_hours(nxt),
+                parse_mode="Markdown"
+            )
         else:
-            user_selections.pop(uid, None)
+            group["user_selections"].pop(uid, None)
             save_db()
-            try:
-                bot.edit_message_text(
-                    generate_summary(), chat, mid,
-                    reply_markup=keyboard_days([]),
-                    parse_mode="Markdown"
-                )
-            except:
-                bot.send_message(chat, generate_summary(), reply_markup=keyboard_days([]))
-
-        bot.answer_callback_query(c.id, "Registrato!")
+            bot.edit_message_text(
+                generate_summary(group),
+                chat_id, msg,
+                reply_markup=keyboard_days([]),
+                parse_mode="Markdown"
+            )
         return
 
 # ============================================================
-#                WEBHOOK ENDPOINTS
+#                WEBHOOK
 # ============================================================
 
 @app.get("/")
 def home():
-    return "OK - Gym Apes Bot running", 200
+    return "OK - Gym Apes Bot (Multigroup)", 200
 
 @app.get("/ping")
 def ping():
@@ -449,10 +400,6 @@ def webhook():
     if update:
         bot.process_new_updates([telebot.types.Update.de_json(update)])
     return "OK", 200
-
-# ============================================================
-#                START
-# ============================================================
 
 if __name__ == "__main__":
     print("🚀 Bot running with webhook...")
