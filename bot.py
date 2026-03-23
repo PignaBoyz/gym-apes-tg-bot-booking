@@ -45,7 +45,8 @@ def ensure_group(chat_id):
     if cid not in GLOBAL_DB["groups"]:
         GLOBAL_DB["groups"][cid] = {
             "db": {g: {h: [] for h in hours} for g in days},
-            "user_selections": {}
+            "user_selections": {},
+            "active_forms": {}  # { uid: mid } - track which message_id is the active form
         }
     return GLOBAL_DB["groups"][cid]
 
@@ -133,6 +134,7 @@ def is_owner(chat_id, user_id):
 def reset_group_state(group):
     group["db"] = {g: {h: [] for h in hours} for g in days}
     group["user_selections"] = {}
+    group["active_forms"] = {}
     save_db()
 
 def get_week_dates():
@@ -272,12 +274,22 @@ def callback(c):
     data = c.data
     mid = c.message.message_id
 
+    # Verifica se questo messaggio è il form attivo di questo utente
+    active_forms = group.get("active_forms", {})
+    if str(uid) in active_forms and active_forms[str(uid)] != mid:
+        # Ignora click su form non attivi
+        bot.answer_callback_query(c.id)
+        return
+
     # ============================================================
     #                DELETE MODE
     # ============================================================
 
     if data == "cancella_tutto":
         st = _ensure_delete_state(chat_id, uid, first, group)
+        group.setdefault("active_forms", {})[str(uid)] = mid
+        save_db()
+        
         try:
             bot.edit_message_text(
                 "Seleziona le prenotazioni da cancellare:",
@@ -321,13 +333,15 @@ def callback(c):
     if data == "delconfirm":
         st = DELETE_STATE.get(str(chat_id), {}).get(uid)
         if not st or not st["selected"]:
+            group.get("active_forms", {}).pop(str(uid), None)
+            save_db()
             try:
                 bot.edit_message_text(
                     generate_summary(group), chat_id, mid,
-                    reply_markup=keyboard_days([]), parse_mode="Markdown"
+                    reply_markup=InlineKeyboardMarkup(), parse_mode="Markdown"
                 )
             except:
-                bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+                bot.send_message(chat_id, generate_summary(group), parse_mode="Markdown")
             bot.answer_callback_query(c.id, "Nessuna selezione da cancellare.")
             return
 
@@ -340,16 +354,17 @@ def callback(c):
 
         # cleanup RAM-only state
         DELETE_STATE[str(chat_id)].pop(uid, None)
+        group.get("active_forms", {}).pop(str(uid), None)
 
         save_db()
 
         try:
             bot.edit_message_text(
                 generate_summary(group), chat_id, mid,
-                reply_markup=keyboard_days([]), parse_mode="Markdown"
+                reply_markup=InlineKeyboardMarkup(), parse_mode="Markdown"
             )
         except:
-            bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+            bot.send_message(chat_id, generate_summary(group), parse_mode="Markdown")
 
         bot.answer_callback_query(c.id, "Prenotazioni selezionate cancellate.")
         return
@@ -357,14 +372,17 @@ def callback(c):
     if data == "delcancel":
         if str(chat_id) in DELETE_STATE:
             DELETE_STATE[str(chat_id)].pop(uid, None)
+        
+        group.get("active_forms", {}).pop(str(uid), None)
+        save_db()
 
         try:
             bot.edit_message_text(
                 generate_summary(group), chat_id, mid,
-                reply_markup=keyboard_days([]), parse_mode="Markdown"
+                reply_markup=InlineKeyboardMarkup(), parse_mode="Markdown"
             )
         except:
-            bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+            bot.send_message(chat_id, generate_summary(group), parse_mode="Markdown")
         bot.answer_callback_query(c.id, "Annullato.")
         return
 
@@ -375,6 +393,8 @@ def callback(c):
     if data.startswith("selgiorno_"):
         d = data.split("_", 1)[1]
         sel = group["user_selections"].setdefault(uid, {"days": [], "index": 0})
+        group.setdefault("active_forms", {})[str(uid)] = mid
+        save_db()
 
         if d in sel["days"]:
             sel["days"].remove(d)
@@ -405,6 +425,7 @@ def callback(c):
 
         sel["index"] = 0
         d0 = sel["days"][0]
+        group.setdefault("active_forms", {})[str(uid)] = mid
         save_db()
 
         try:
@@ -457,16 +478,18 @@ def callback(c):
                     parse_mode="Markdown"
                 )
         else:
+            # ✅ COMPLETED - Rimozione dello stato e chiusura del form
             group["user_selections"].pop(uid, None)
+            group.get("active_forms", {}).pop(str(uid), None)
             save_db()
 
             try:
                 bot.edit_message_text(
                     generate_summary(group), chat_id, mid,
-                    reply_markup=keyboard_days([]), parse_mode="Markdown"
+                    reply_markup=InlineKeyboardMarkup(), parse_mode="Markdown"
                 )
             except:
-                bot.send_message(chat_id, generate_summary(group), reply_markup=keyboard_days([]))
+                bot.send_message(chat_id, generate_summary(group), parse_mode="Markdown")
 
         bot.answer_callback_query(c.id, "Registrato!")
         return
