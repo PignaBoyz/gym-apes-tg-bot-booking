@@ -229,11 +229,16 @@ Il webhook è ora attivo.
 
 Render mette in pausa il servizio dopo ~15 minuti senza richieste HTTP.
 
-Registra l'endpoint `/ping` su [https://hosting.aifordiscord.xyz](https://hosting.aifordiscord.xyz):
-```
-https://TUOBOT.onrender.com/ping
-```
-Questo pinga il bot ogni 5 minuti e lo tiene attivo.
+Usa [UptimeRobot](https://uptimerobot.com) (gratuito):
+
+1. Crea un account su [https://uptimerobot.com](https://uptimerobot.com)
+2. Clicca **"+ Add New Monitor"**
+3. Configura:
+   - **Monitor Type**: HTTP(s)
+   - **Friendly Name**: Gym Apes Bot
+   - **URL**: `https://gym-apes-tg-bot-booking.onrender.com/ping`
+   - **Monitoring Interval**: 5 minutes
+4. Salva — il bot resterà sempre sveglio
 
 ---
 
